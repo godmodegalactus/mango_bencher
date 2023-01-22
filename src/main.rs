@@ -17,8 +17,8 @@ use solana_bench_mango::{
     mango::{AccountKeys, MangoConfig},
 };
 use solana_client::{
-    connection_cache::ConnectionCache, rpc_client::RpcClient, rpc_config::RpcBlockConfig,
-    tpu_client::TpuClient,
+    bidirectional_channel_handler::BidirectionalChannelHandler, connection_cache::ConnectionCache,
+    rpc_client::RpcClient, rpc_config::RpcBlockConfig, tpu_client::TpuClient,
 };
 use solana_program::native_token::LAMPORTS_PER_SOL;
 use solana_runtime::bank::RewardType;
@@ -33,6 +33,7 @@ use solana_sdk::{
 };
 
 use solana_program::pubkey::Pubkey;
+use solana_transaction_status::UiTransactionStatusMeta;
 
 use std::{
     collections::HashMap,
@@ -127,20 +128,83 @@ struct TransactionSendRecord {
 }
 
 #[derive(Clone, Serialize)]
-struct TransactionConfirmRecord {
+struct TransactionRecord {
     pub signature: String,
     pub sent_slot: Slot,
     pub sent_at: String,
-    pub confirmed_slot: Slot,
-    pub confirmed_at: String,
+    pub confirmed_slot: Option<Slot>,
+    pub confirmed_at: Option<String>,
     pub successful: bool,
-    pub slot_leader: String,
+    pub slot_leader: Option<String>,
     pub error: String,
     pub market_maker: String,
     pub market: String,
-    pub block_hash: String,
-    pub slot_processed: Slot,
-    pub timed_out: bool,
+    pub block_hash: Option<String>,
+    pub slot_processed: Option<Slot>,
+    pub timeout: bool,
+    pub message_in_bidirectional_replies: Option<String>,
+}
+
+impl TransactionRecord {
+    pub fn new_confirmed(
+        transaction_record: &TransactionSendRecord,
+        slot: Slot,
+        meta: &Option<UiTransactionStatusMeta>,
+        block_hash: String,
+        slot_leader: String,
+        message_in_bidirectional_replies: Option<String>,
+    ) -> Self {
+        Self {
+            signature: transaction_record.signature.to_string(),
+            confirmed_slot: Some(slot), // TODO: should be changed to correct slot
+            confirmed_at: Some(Utc::now().to_string()),
+            sent_at: transaction_record.sent_at.to_string(),
+            sent_slot: transaction_record.sent_slot,
+            successful: if let Some(meta) = &meta {
+                meta.status.is_ok()
+            } else {
+                false
+            },
+            error: if let Some(meta) = &meta {
+                match &meta.err {
+                    Some(x) => x.to_string(),
+                    None => "".to_string(),
+                }
+            } else {
+                "".to_string()
+            },
+            block_hash: Some(block_hash),
+            market: transaction_record.market.to_string(),
+            market_maker: transaction_record.market_maker.to_string(),
+            slot_processed: Some(slot),
+            slot_leader: Some(slot_leader),
+            timeout: false,
+            message_in_bidirectional_replies,
+        }
+    }
+
+    pub fn new_errored(
+        transaction_record: &TransactionSendRecord,
+        error: String,
+        message_in_bidirectional_replies: Option<String>,
+    ) -> Self {
+        Self {
+            signature: transaction_record.signature.to_string(),
+            confirmed_slot: None, // TODO: should be changed to correct slot
+            confirmed_at: None,
+            sent_at: transaction_record.sent_at.to_string(),
+            sent_slot: transaction_record.sent_slot,
+            successful: false,
+            error: error,
+            block_hash: None,
+            market: transaction_record.market.to_string(),
+            market_maker: transaction_record.market_maker.to_string(),
+            slot_processed: None,
+            slot_leader: None,
+            timeout: true,
+            message_in_bidirectional_replies,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -389,178 +453,6 @@ fn send_mm_transactions_batched(
     }
 }
 
-fn process_signature_confirmation_batch(
-    rpc_client: &RpcClient,
-    batch: &Vec<TransactionSendRecord>,
-    not_confirmed: &Arc<RwLock<Vec<TransactionSendRecord>>>,
-    confirmed: &Arc<RwLock<Vec<TransactionConfirmRecord>>>,
-    timeouts: Arc<RwLock<Vec<TransactionSendRecord>>>,
-    timeout: u64,
-) {
-    match rpc_client.get_signature_statuses(&batch.iter().map(|t| t.signature).collect::<Vec<_>>())
-    {
-        Ok(statuses) => {
-            trace!("batch result {:?}", statuses);
-            for (i, s) in statuses.value.iter().enumerate() {
-                let tx_record = &batch[i];
-                match s {
-                    Some(s) => {
-                        if s.confirmation_status.is_none() {
-                            not_confirmed.write().unwrap().push(tx_record.clone());
-                        } else {
-                            let mut lock = confirmed.write().unwrap();
-                            (*lock).push(TransactionConfirmRecord {
-                                signature: tx_record.signature.to_string(),
-                                sent_slot: tx_record.sent_slot,
-                                sent_at: tx_record.sent_at.to_string(),
-                                confirmed_at: Utc::now().to_string(),
-                                confirmed_slot: s.slot,
-                                successful: s.err.is_none(),
-                                error: match &s.err {
-                                    Some(e) => e.to_string(),
-                                    None => "".to_string(),
-                                },
-                                block_hash: Pubkey::default().to_string(),
-                                slot_leader: Pubkey::default().to_string(),
-                                market: tx_record.market.to_string(),
-                                market_maker: tx_record.market_maker.to_string(),
-                                slot_processed: tx_record.sent_slot,
-                                timed_out: false,
-                            });
-
-                            debug!(
-                                "confirmed sig={} duration={:?}",
-                                tx_record.signature,
-                                seconds_since(tx_record.sent_at)
-                            );
-                        }
-                    }
-                    None => {
-                        if seconds_since(tx_record.sent_at) > timeout as i64 {
-                            debug!(
-                                "could not confirm tx {} within {} seconds, dropping it",
-                                tx_record.signature, timeout
-                            );
-                            let mut lock = timeouts.write().unwrap();
-                            (*lock).push(tx_record.clone())
-                        } else {
-                            not_confirmed.write().unwrap().push(tx_record.clone());
-                        }
-                    }
-                }
-            }
-        }
-        Err(err) => {
-            error!("could not confirm signatures err={}", err);
-            not_confirmed.write().unwrap().extend_from_slice(batch);
-            sleep(Duration::from_millis(500));
-        }
-    }
-}
-
-fn confirmation_by_querying_rpc(
-    recv_limit: usize,
-    rpc_client: Arc<RpcClient>,
-    tx_record_rx: &Receiver<TransactionSendRecord>,
-    tx_confirm_records: Arc<RwLock<Vec<TransactionConfirmRecord>>>,
-    tx_timeout_records: Arc<RwLock<Vec<TransactionSendRecord>>>,
-) {
-    const TIMEOUT: u64 = 30;
-    let mut recv_until_confirm = recv_limit;
-    let not_confirmed: Arc<RwLock<Vec<TransactionSendRecord>>> = Arc::new(RwLock::new(Vec::new()));
-    loop {
-        let has_signatures_to_confirm = { not_confirmed.read().unwrap().len() > 0 };
-        if has_signatures_to_confirm {
-            // collect all not confirmed records in a new buffer
-
-            const BATCH_SIZE: usize = 256;
-            let to_confirm = {
-                let mut lock = not_confirmed.write().unwrap();
-                let to_confirm = (*lock).clone();
-                (*lock).clear();
-                to_confirm
-            };
-
-            info!(
-                "break from reading channel, try to confirm {} in {} batches",
-                to_confirm.len(),
-                (to_confirm.len() / BATCH_SIZE)
-                    + if to_confirm.len() % BATCH_SIZE > 0 {
-                        1
-                    } else {
-                        0
-                    }
-            );
-
-            let confirmed = tx_confirm_records.clone();
-            let timeouts = tx_timeout_records.clone();
-            for batch in to_confirm.rchunks(BATCH_SIZE).map(|x| x.to_vec()) {
-                process_signature_confirmation_batch(
-                    &rpc_client,
-                    &batch,
-                    &not_confirmed,
-                    &confirmed,
-                    timeouts.clone(),
-                    TIMEOUT,
-                );
-            }
-            // multi threaded implementation of confirming batches
-            // let mut confirmation_handles = Vec::new();
-            // for batch in to_confirm.rchunks(BATCH_SIZE).map(|x| x.to_vec()) {
-            //     let rpc_client = rpc_client.clone();
-            //     let not_confirmed = not_confirmed.clone();
-            //     let confirmed = tx_confirm_records.clone();
-
-            //     let join_handle = Builder::new().name("solana-transaction-confirmation".to_string()).spawn(move || {
-            //         process_signature_confirmation_batch(&rpc_client, &batch, &not_confirmed, &confirmed, TIMEOUT)
-            //     }).unwrap();
-            //     confirmation_handles.push(join_handle);
-            // };
-            // for confirmation_handle in confirmation_handles {
-            //     let (errors, timeouts) = confirmation_handle.join().unwrap();
-            //     error_count += errors;
-            //     timeout_count += timeouts;
-            // }
-            // sleep(Duration::from_millis(100)); // so the confirmation thread does not spam a lot the rpc node
-        }
-        {
-            if recv_until_confirm == 0 && not_confirmed.read().unwrap().len() == 0 {
-                break;
-            }
-        }
-        // context for writing all the not_confirmed_transactions
-        if recv_until_confirm > 0 {
-            let mut lock = not_confirmed.write().unwrap();
-            loop {
-                match tx_record_rx.try_recv() {
-                    Ok(tx_record) => {
-                        debug!(
-                            "add to queue len={} sig={}",
-                            (*lock).len() + 1,
-                            tx_record.signature
-                        );
-                        (*lock).push(tx_record);
-
-                        recv_until_confirm -= 1;
-                    }
-                    Err(TryRecvError::Empty) => {
-                        debug!("channel emptied");
-                        sleep(Duration::from_millis(100));
-                        break; // still confirm remaining transctions
-                    }
-                    Err(TryRecvError::Disconnected) => {
-                        {
-                            info!("channel disconnected {}", recv_until_confirm);
-                        }
-                        debug!("channel disconnected");
-                        break; // still confirm remaining transctions
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[derive(Clone, Serialize)]
 struct BlockData {
     pub block_hash: String,
@@ -578,9 +470,9 @@ fn confirmations_by_blocks(
     current_slot: &AtomicU64,
     recv_limit: usize,
     tx_record_rx: Receiver<TransactionSendRecord>,
-    tx_confirm_records: Arc<RwLock<Vec<TransactionConfirmRecord>>>,
-    tx_timeout_records: Arc<RwLock<Vec<TransactionSendRecord>>>,
+    tx_confirm_records: Arc<RwLock<Vec<TransactionRecord>>>,
     tx_block_data: Arc<RwLock<Vec<BlockData>>>,
+    bidirectional_replies: Arc<RwLock<HashMap<Signature, String>>>,
 ) {
     let mut recv_until_confirm = recv_limit;
     let transaction_map = Arc::new(RwLock::new(
@@ -640,9 +532,11 @@ fn confirmations_by_blocks(
         let client = clients.get().clone();
         let tx_confirm_records = tx_confirm_records.clone();
         let tx_block_data = tx_block_data.clone();
+        let bidirectional_replies = bidirectional_replies.clone();
         let joinble = Builder::new()
             .name("getting blocks and searching transactions".to_string())
             .spawn(move || {
+                let bidirectional_replies = bidirectional_replies.read().unwrap();
                 for slot in slot_batch {
                     // retry search for block 10 times
                     let mut block = None;
@@ -690,7 +584,7 @@ fn confirmations_by_blocks(
                         for solana_transaction_status::EncodedTransactionWithStatusMeta {
                             transaction,
                             meta,
-                            version,
+                            ..
                         } in transactions
                         {
                             if let solana_transaction_status::EncodedTransaction::Json(
@@ -730,33 +624,16 @@ fn confirmations_by_blocks(
 
                                         let mut lock = tx_confirm_records.write().unwrap();
                                         mm_transaction_count += 1;
+                                        let bidir_message = bidirectional_replies.get(&signature).map(|x| x.clone());
 
-                                        (*lock).push(TransactionConfirmRecord {
-                                            signature: transaction_record.signature.to_string(),
-                                            confirmed_slot: slot, // TODO: should be changed to correct slot
-                                            confirmed_at: Utc::now().to_string(),
-                                            sent_at: transaction_record.sent_at.to_string(),
-                                            sent_slot: transaction_record.sent_slot,
-                                            successful: if let Some(meta) = &meta {
-                                                meta.status.is_ok()
-                                            } else {
-                                                false
-                                            },
-                                            error: if let Some(meta) = &meta {
-                                                match &meta.err {
-                                                    Some(x) => x.to_string(),
-                                                    None => "".to_string(),
-                                                }
-                                            } else {
-                                                "".to_string()
-                                            },
-                                            block_hash: block.blockhash.clone(),
-                                            market: transaction_record.market.to_string(),
-                                            market_maker: transaction_record.market_maker.to_string(),
-                                            slot_processed: slot,
-                                            slot_leader: slot_leader.clone(),
-                                            timed_out: false,
-                                        })
+                                        (*lock).push( TransactionRecord::new_confirmed(
+                                            &transaction_record,
+                                            slot,
+                                            &meta,
+                                            block.blockhash.clone(),
+                                            slot_leader.clone(),
+                                            bidir_message,
+                                        ) );
                                     }
 
                                     map.write().unwrap().remove(&signature);
@@ -791,11 +668,30 @@ fn confirmations_by_blocks(
         handle.join().unwrap();
     }
 
-    let mut timeout_writer = tx_timeout_records.write().unwrap();
-    for x in transaction_map.read().unwrap().iter() {
-        timeout_writer.push(x.1.clone())
+    // process records where we had bidirectional replies
+    let remaining_transactions = transaction_map.write().unwrap();
+    let mut records = tx_confirm_records.write().unwrap();
+    let bidirectional_replies = bidirectional_replies.read().unwrap();
+    for x in remaining_transactions.iter() {
+        let v = bidirectional_replies.get(x.0);
+        match v {
+            Some(v) => {
+                records.push(TransactionRecord::new_errored(
+                    x.1,
+                    v.clone(),
+                    Some(v.clone()),
+                ));
+            }
+            None => {
+                // timeout
+                records.push(TransactionRecord::new_errored(
+                    x.1,
+                    "timeout".to_string(),
+                    None,
+                ));
+            }
+        }
     }
-
     // sort all blocks by slot and print info
     {
         let mut blockstats_writer = tx_block_data.write().unwrap();
@@ -814,8 +710,7 @@ fn confirmations_by_blocks(
 
 fn write_transaction_data_into_csv(
     transaction_save_file: String,
-    tx_confirm_records: Arc<RwLock<Vec<TransactionConfirmRecord>>>,
-    tx_timeout_records: Arc<RwLock<Vec<TransactionSendRecord>>>,
+    tx_confirm_records: Arc<RwLock<Vec<TransactionRecord>>>,
 ) {
     if transaction_save_file.is_empty() {
         return;
@@ -825,27 +720,6 @@ fn write_transaction_data_into_csv(
         let rd_lock = tx_confirm_records.read().unwrap();
         for confirm_record in rd_lock.iter() {
             writer.serialize(confirm_record).unwrap();
-        }
-
-        let timeout_lk = tx_timeout_records.read().unwrap();
-        for timeout_record in timeout_lk.iter() {
-            writer
-                .serialize(TransactionConfirmRecord {
-                    block_hash: "".to_string(),
-                    confirmed_at: "".to_string(),
-                    confirmed_slot: 0,
-                    error: "Timeout".to_string(),
-                    market: timeout_record.market.to_string(),
-                    market_maker: timeout_record.market_maker.to_string(),
-                    sent_at: timeout_record.sent_at.to_string(),
-                    sent_slot: timeout_record.sent_slot,
-                    signature: timeout_record.signature.to_string(),
-                    slot_leader: "".to_string(),
-                    slot_processed: 0,
-                    successful: false,
-                    timed_out: true,
-                })
-                .unwrap();
         }
     }
     writer.flush().unwrap();
@@ -915,6 +789,29 @@ fn main() {
             CommitmentConfig::confirmed(),
         ))
     });
+    let bidirectional_reply_handler = BidirectionalChannelHandler::new();
+
+    let hashmap_bidirectional_replies = Arc::new(RwLock::new(HashMap::new()));
+    let _reply_print_jh = {
+        let reply_handler = bidirectional_reply_handler.clone();
+        let hashmap_bidirectional_replies = hashmap_bidirectional_replies.clone();
+        std::thread::spawn(move || {
+            let reply_handler = reply_handler;
+            loop {
+                let hash_map = hashmap_bidirectional_replies.clone();
+                let res = reply_handler.reciever.recv();
+                match res {
+                    Ok(message) => {
+                        let mut writer = hash_map.write().unwrap();
+                        writer.insert(message.signature(), message.message());
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+        })
+    };
 
     let tpu_client_pool = Arc::new(RotatingQueue::<Arc<TpuClient>>::new(
         number_of_tpu_clients,
@@ -924,7 +821,10 @@ fn main() {
                     rpc_clients.get().clone(),
                     &websocket_url,
                     solana_client::tpu_client::TpuClientConfig::default(),
-                    Arc::new(ConnectionCache::default()),
+                    Arc::new(ConnectionCache::new_with_replies_from_tpu(
+                        4,
+                        bidirectional_reply_handler.clone(),
+                    )),
                 )
                 .unwrap(),
             )
@@ -990,10 +890,10 @@ fn main() {
             let base_unit = I80F48::from_num(10u64.pow(base_decimals as u32));
             let quote_unit = I80F48::from_num(10u64.pow(quote_decimals as u32));
             let price = mango_cache.price_cache[market_index].price;
-            println!(
-                "market index {} price of  : {}",
-                market_index, mango_cache.price_cache[market_index].price
-            );
+            // println!(
+            //     "market index {} price of  : {}",
+            //     market_index, mango_cache.price_cache[market_index].price
+            // );
 
             let price_quote_lots: i64 = price
                 .mul(quote_unit)
@@ -1116,10 +1016,8 @@ fn main() {
     let duration = duration.clone();
     let quotes_per_second = quotes_per_second.clone();
     let account_keys_parsed = account_keys_parsed.clone();
-    let tx_confirm_records: Arc<RwLock<Vec<TransactionConfirmRecord>>> =
-        Arc::new(RwLock::new(Vec::new()));
-    let tx_timeout_records: Arc<RwLock<Vec<TransactionSendRecord>>> =
-        Arc::new(RwLock::new(Vec::new()));
+    let tx_confirm_records: Arc<RwLock<Vec<TransactionRecord>>> = Arc::new(RwLock::new(Vec::new()));
+    let hashmap_bidirectional_replies = hashmap_bidirectional_replies.clone();
 
     let tx_block_data = Arc::new(RwLock::new(Vec::<BlockData>::new()));
 
@@ -1138,39 +1036,39 @@ fn main() {
                 recv_limit,
                 tx_record_rx,
                 tx_confirm_records.clone(),
-                tx_timeout_records.clone(),
                 tx_block_data.clone(),
+                hashmap_bidirectional_replies.clone(),
             );
 
-            let confirmed: Vec<TransactionConfirmRecord> = {
-                let lock = tx_confirm_records.write().unwrap();
+            let records: Vec<TransactionRecord> = {
+                let lock = tx_confirm_records.read().unwrap();
                 (*lock).clone()
             };
+            let confirmed_length = records.iter().filter(|x| !x.timeout).count();
+            let timed_out = records.len() - confirmed_length;
             let total_signed = account_keys_parsed.len()
                 * perp_market_caches.len()
                 * duration.as_secs() as usize
                 * quotes_per_second as usize;
             info!(
                 "confirmed {} signatures of {} rate {}%",
-                confirmed.len(),
+                confirmed_length,
                 total_signed,
-                (confirmed.len() * 100) / total_signed
+                (confirmed_length * 100) / total_signed
             );
-            let error_count = confirmed.iter().filter(|tx| !tx.error.is_empty()).count();
+            let error_count = records
+                .iter()
+                .filter(|tx| !tx.timeout && !tx.error.is_empty())
+                .count();
             info!(
                 "errors counted {} rate {}%",
                 error_count,
                 (error_count as usize * 100) / total_signed
             );
-            let timeouts: Vec<TransactionSendRecord> = {
-                let timeouts = tx_timeout_records.clone();
-                let lock = timeouts.write().unwrap();
-                (*lock).clone()
-            };
             info!(
                 "timeouts counted {} rate {}%",
-                timeouts.len(),
-                (timeouts.len() * 100) / total_signed
+                timed_out,
+                (timed_out * 100) / total_signed
             );
 
             // let mut confirmation_times = confirmed
@@ -1189,11 +1087,7 @@ fn main() {
             //     confirmation_times[confirmation_times.len() / 2]
             // );
 
-            write_transaction_data_into_csv(
-                transaction_save_file,
-                tx_confirm_records,
-                tx_timeout_records,
-            );
+            write_transaction_data_into_csv(transaction_save_file, tx_confirm_records);
 
             write_block_data_into_csv(block_data_save_file, tx_block_data);
         })
