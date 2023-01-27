@@ -17,8 +17,11 @@ use solana_bench_mango::{
     mango::{AccountKeys, MangoConfig},
 };
 use solana_client::{
-    bidirectional_channel_handler::BidirectionalChannelHandler, connection_cache::ConnectionCache,
-    rpc_client::RpcClient, rpc_config::RpcBlockConfig, tpu_client::TpuClient,
+    bidirectional_channel_handler::{BidirectionalChannelHandler, QuicHandlerMessage},
+    connection_cache::ConnectionCache,
+    rpc_client::RpcClient,
+    rpc_config::RpcBlockConfig,
+    tpu_client::TpuClient,
 };
 use solana_program::native_token::LAMPORTS_PER_SOL;
 use solana_runtime::bank::RewardType;
@@ -33,6 +36,7 @@ use solana_sdk::{
 };
 
 use solana_program::pubkey::Pubkey;
+use solana_streamer::bidirectional_channel::QuicReplyMessage;
 use solana_transaction_status::UiTransactionStatusMeta;
 
 use std::{
@@ -274,86 +278,108 @@ fn create_ask_bid_transaction(
     c: &PerpMarketCache,
     mango_account_pk: Pubkey,
     mango_account_signer: &Keypair,
+    just_cancel: bool,
 ) -> Transaction {
     let mango_account_signer_pk = to_sp_pk(&mango_account_signer.pubkey());
-    let offset = rand::random::<i8>() as i64;
-    let spread = rand::random::<u8>() as i64;
-    debug!(
-        "price:{:?} price_quote_lots:{:?} order_base_lots:{:?} offset:{:?} spread:{:?}",
-        c.price, c.price_quote_lots, c.order_base_lots, offset, spread
-    );
-    let cancel_ix: Instruction = to_sdk_instruction(
-        cancel_all_perp_orders(
-            &c.mango_program_pk,
-            &c.mango_group_pk,
-            &mango_account_pk,
-            &mango_account_signer_pk,
-            &c.perp_market_pk,
-            &c.perp_market.bids,
-            &c.perp_market.asks,
-            10,
-        )
-        .unwrap(),
-    );
+    if just_cancel {
+        let cancel_ix: Instruction = to_sdk_instruction(
+            cancel_all_perp_orders(
+                &c.mango_program_pk,
+                &c.mango_group_pk,
+                &mango_account_pk,
+                &mango_account_signer_pk,
+                &c.perp_market_pk,
+                &c.perp_market.bids,
+                &c.perp_market.asks,
+                10,
+            )
+            .unwrap(),
+        );
 
-    let place_bid_ix: Instruction = to_sdk_instruction(
-        place_perp_order2(
-            &c.mango_program_pk,
-            &c.mango_group_pk,
-            &mango_account_pk,
-            &mango_account_signer_pk,
-            &c.mango_cache_pk,
-            &c.perp_market_pk,
-            &c.perp_market.bids,
-            &c.perp_market.asks,
-            &c.perp_market.event_queue,
-            None,
-            &[],
-            Side::Bid,
-            c.price_quote_lots + offset - spread,
-            c.order_base_lots,
-            i64::MAX,
-            1,
-            mango::matching::OrderType::Limit,
-            false,
-            None,
-            64,
-            mango::matching::ExpiryType::Absolute,
-        )
-        .unwrap(),
-    );
+        Transaction::new_unsigned(Message::new(
+            &[cancel_ix],
+            Some(&mango_account_signer.pubkey()),
+        ))
+    } else {
+        let offset = rand::random::<i8>() as i64;
+        let spread = rand::random::<u8>() as i64;
+        debug!(
+            "price:{:?} price_quote_lots:{:?} order_base_lots:{:?} offset:{:?} spread:{:?}",
+            c.price, c.price_quote_lots, c.order_base_lots, offset, spread
+        );
+        let cancel_ix: Instruction = to_sdk_instruction(
+            cancel_all_perp_orders(
+                &c.mango_program_pk,
+                &c.mango_group_pk,
+                &mango_account_pk,
+                &mango_account_signer_pk,
+                &c.perp_market_pk,
+                &c.perp_market.bids,
+                &c.perp_market.asks,
+                10,
+            )
+            .unwrap(),
+        );
 
-    let place_ask_ix: Instruction = to_sdk_instruction(
-        place_perp_order2(
-            &c.mango_program_pk,
-            &c.mango_group_pk,
-            &mango_account_pk,
-            &mango_account_signer_pk,
-            &c.mango_cache_pk,
-            &c.perp_market_pk,
-            &c.perp_market.bids,
-            &c.perp_market.asks,
-            &c.perp_market.event_queue,
-            None,
-            &[],
-            Side::Ask,
-            c.price_quote_lots + offset + spread,
-            c.order_base_lots,
-            i64::MAX,
-            2,
-            mango::matching::OrderType::Limit,
-            false,
-            None,
-            64,
-            mango::matching::ExpiryType::Absolute,
-        )
-        .unwrap(),
-    );
+        let place_bid_ix: Instruction = to_sdk_instruction(
+            place_perp_order2(
+                &c.mango_program_pk,
+                &c.mango_group_pk,
+                &mango_account_pk,
+                &mango_account_signer_pk,
+                &c.mango_cache_pk,
+                &c.perp_market_pk,
+                &c.perp_market.bids,
+                &c.perp_market.asks,
+                &c.perp_market.event_queue,
+                None,
+                &[],
+                Side::Bid,
+                c.price_quote_lots + offset - spread,
+                c.order_base_lots,
+                i64::MAX,
+                1,
+                mango::matching::OrderType::Limit,
+                false,
+                None,
+                64,
+                mango::matching::ExpiryType::Absolute,
+            )
+            .unwrap(),
+        );
 
-    Transaction::new_unsigned(Message::new(
-        &[cancel_ix, place_bid_ix, place_ask_ix],
-        Some(&mango_account_signer.pubkey()),
-    ))
+        let place_ask_ix: Instruction = to_sdk_instruction(
+            place_perp_order2(
+                &c.mango_program_pk,
+                &c.mango_group_pk,
+                &mango_account_pk,
+                &mango_account_signer_pk,
+                &c.mango_cache_pk,
+                &c.perp_market_pk,
+                &c.perp_market.bids,
+                &c.perp_market.asks,
+                &c.perp_market.event_queue,
+                None,
+                &[],
+                Side::Ask,
+                c.price_quote_lots + offset + spread,
+                c.order_base_lots,
+                i64::MAX,
+                2,
+                mango::matching::OrderType::Limit,
+                false,
+                None,
+                64,
+                mango::matching::ExpiryType::Absolute,
+            )
+            .unwrap(),
+        );
+
+        Transaction::new_unsigned(Message::new(
+            &[cancel_ix, place_bid_ix, place_ask_ix],
+            Some(&mango_account_signer.pubkey()),
+        ))
+    }
 }
 
 fn send_mm_transactions(
@@ -368,9 +394,10 @@ fn send_mm_transactions(
 ) {
     let mango_account_signer_pk = to_sp_pk(&mango_account_signer.pubkey());
     // update quotes 2x per second
-    for _ in 0..quotes_per_second {
+    for i in 0..quotes_per_second {
         for c in perp_market_caches.iter() {
-            let mut tx = create_ask_bid_transaction(c, mango_account_pk, &mango_account_signer);
+            let mut tx =
+                create_ask_bid_transaction(c, mango_account_pk, &mango_account_signer, i == 0);
 
             if let Ok(recent_blockhash) = blockhash.read() {
                 tx.sign(&[mango_account_signer], *recent_blockhash);
@@ -409,13 +436,14 @@ fn send_mm_transactions_batched(
 
     let mango_account_signer_pk = to_sp_pk(&mango_account_signer.pubkey());
     // update quotes 2x per second
-    for _ in 0..quotes_per_second {
+    for i in 0..quotes_per_second {
         for c in perp_market_caches.iter() {
-            for _ in 0..txs_batch_size {
+            for j in 0..txs_batch_size {
                 transactions.push(create_ask_bid_transaction(
                     c,
                     mango_account_pk,
                     &mango_account_signer,
+                    i == 0 && j == 0,
                 ));
             }
 
@@ -465,20 +493,37 @@ struct BlockData {
     pub mm_cu_consumed: u64,
 }
 
+fn aggregate_quic_messages(data: &Vec<QuicHandlerMessage>) -> String {
+    let mut agg = HashMap::<String, Vec<u64>>::new();
+    for d in data {
+        match agg.get_mut(&d.message()) {
+            Some(x) => {
+                x.push(d.approximate_slot());
+            }
+            None => {
+                agg.insert(d.message(), vec![d.approximate_slot()]);
+            }
+        }
+    }
+    agg.iter()
+        .map(|(message, slots)| format!("{} ({:?}), ", message, slots))
+        .reduce(|acc, e| acc + e.as_str())
+        .unwrap()
+}
+
 fn confirmations_by_blocks(
     clients: RotatingQueue<Arc<RpcClient>>,
-    current_slot: &AtomicU64,
+    start_slot: Slot,
     recv_limit: usize,
     tx_record_rx: Receiver<TransactionSendRecord>,
     tx_confirm_records: Arc<RwLock<Vec<TransactionRecord>>>,
     tx_block_data: Arc<RwLock<Vec<BlockData>>>,
-    bidirectional_replies: Arc<RwLock<HashMap<Signature, String>>>,
+    bidirectional_replies: Arc<RwLock<HashMap<Signature, Vec<QuicHandlerMessage>>>>,
 ) {
     let mut recv_until_confirm = recv_limit;
     let transaction_map = Arc::new(RwLock::new(
         HashMap::<Signature, TransactionSendRecord>::new(),
     ));
-    let last_slot = current_slot.load(Ordering::Acquire);
 
     while recv_until_confirm != 0 {
         match tx_record_rx.try_recv() {
@@ -506,13 +551,13 @@ fn confirmations_by_blocks(
         }
     }
     println!("finished mapping all the trasactions");
-    sleep(Duration::from_secs(30));
+    sleep(Duration::from_secs(120));
     let commitment_confirmation = CommitmentConfig {
         commitment: CommitmentLevel::Confirmed,
     };
     let block_res = clients
         .get()
-        .get_blocks_with_commitment(last_slot, None, commitment_confirmation)
+        .get_blocks_with_commitment(start_slot, None, commitment_confirmation)
         .unwrap();
 
     let nb_blocks = block_res.len();
@@ -624,7 +669,7 @@ fn confirmations_by_blocks(
 
                                         let mut lock = tx_confirm_records.write().unwrap();
                                         mm_transaction_count += 1;
-                                        let bidir_message = bidirectional_replies.get(&signature).map(|x| x.clone());
+                                        let bidir_message = bidirectional_replies.get(&signature).map(|x| aggregate_quic_messages(x));
 
                                         (*lock).push( TransactionRecord::new_confirmed(
                                             &transaction_record,
@@ -678,8 +723,8 @@ fn confirmations_by_blocks(
             Some(v) => {
                 records.push(TransactionRecord::new_errored(
                     x.1,
-                    v.clone(),
-                    Some(v.clone()),
+                    "timeout".to_string(),
+                    Some(aggregate_quic_messages(v)),
                 ));
             }
             None => {
@@ -789,9 +834,13 @@ fn main() {
             CommitmentConfig::confirmed(),
         ))
     });
+    let start_slot = rpc_clients.get().get_slot().unwrap();
     let bidirectional_reply_handler = BidirectionalChannelHandler::new();
 
-    let hashmap_bidirectional_replies = Arc::new(RwLock::new(HashMap::new()));
+    let hashmap_bidirectional_replies = Arc::new(RwLock::new(HashMap::<
+        Signature,
+        Vec<QuicHandlerMessage>,
+    >::new()));
     let _reply_print_jh = {
         let reply_handler = bidirectional_reply_handler.clone();
         let hashmap_bidirectional_replies = hashmap_bidirectional_replies.clone();
@@ -803,7 +852,14 @@ fn main() {
                 match res {
                     Ok(message) => {
                         let mut writer = hash_map.write().unwrap();
-                        writer.insert(message.signature(), message.message());
+                        match writer.get_mut(&message.signature()) {
+                            Some(x) => {
+                                x.push(message);
+                            }
+                            None => {
+                                writer.insert(message.signature(), vec![message]);
+                            }
+                        }
                     }
                     Err(_) => {
                         break;
@@ -1032,7 +1088,7 @@ fn main() {
             //confirmation_by_querying_rpc(recv_limit, rpc_client.clone(), &tx_record_rx, tx_confirm_records.clone(), tx_timeout_records.clone());
             confirmations_by_blocks(
                 rpc_clients,
-                &current_slot,
+                start_slot,
                 recv_limit,
                 tx_record_rx,
                 tx_confirm_records.clone(),
